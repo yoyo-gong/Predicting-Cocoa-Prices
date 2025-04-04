@@ -1,0 +1,772 @@
+```{r}
+library(forecast)
+library(tidyverse)
+
+# Step 1: Load the weekly data
+df <- read.csv("weekly_aggregated_data.csv")
+df$date <- as.Date(df$date)
+
+# Step 2: Create weighted weather variables (optional for ARIMAX later)
+df$PRCP_weighted <- 0.6 * df$PRCP_CI + 0.4 * df$PRCP_GH
+df$TAVG_weighted <- 0.6 * df$TAVG_CI + 0.4 * df$TAVG_GH
+
+# Step 3: Split into train/test
+train_df <- df[df$date <= "2024-11-30", ]
+test_df <- df[df$date > "2024-11-30", ]
+
+# Step 4: Prepare time series
+y_train <- ts(train_df$price, frequency = 52)  # weekly frequency
+y_test <- test_df$price
+n_ahead <- length(y_test)
+
+# Step 5: Set up grid of ARIMA orders
+orders <- expand.grid(p = 1:5, d = 1, q = 1:5)
+
+# Step 6: Loop through and fit ARIMA models
+results <- list()
+
+for (i in 1:nrow(orders)) {
+  p <- orders$p[i]
+  d <- orders$d[i]
+  q <- orders$q[i]
+  model_label <- paste0("ARIMA(", p, ",", d, ",", q, ")")
+  
+  try({
+    fit <- Arima(y_train, order = c(p, d, q))
+    fcast <- forecast(fit, h = n_ahead)
+    pred <- as.numeric(fcast$mean)
+    
+    # Evaluation metrics
+    mae <- mean(abs(pred - y_test))
+    rmse <- sqrt(mean((pred - y_test)^2))
+    mape <- mean(abs((pred - y_test) / y_test)) * 100
+    aic <- AIC(fit)
+    
+    results[[model_label]] <- c(AIC = aic, MAE = mae, RMSE = rmse, MAPE = mape)
+  }, silent = TRUE)
+}
+
+# Step 7: Combine and sort results
+model_results <- do.call(rbind, results) %>%
+  as.data.frame() %>%
+  rownames_to_column("Model") %>%
+  arrange(MAPE)
+
+# Step 8: View best models
+print(model_results)
+```
+
+```{r}
+# Load necessary library
+library(tidyverse)
+
+# Load the dataset
+df <- read.csv("weekly_with_usd_open.csv")
+df$date <- as.Date(df$date)
+
+# Summary for cocoa prices
+summary(df$price)
+
+# Summary for weather data (Côte d'Ivoire and Ghana)
+summary(dplyr::select(df, PRCP_CI, PRCP_GH, TAVG_CI, TAVG_GH))
+
+# Summary for USD Index
+summary(df$usd_open)
+```
+
+```{r}
+library(rugarch)
+library(tibble)
+library(dplyr)
+
+# Load data
+weekly_df <- read.csv("weekly_aggregated_data.csv")
+weekly_df$date <- as.Date(weekly_df$date)
+
+# Create weighted weather variables
+weekly_df$PRCP_weighted <- 0.6 * weekly_df$PRCP_CI + 0.4 * weekly_df$PRCP_GH
+weekly_df$TAVG_weighted <- 0.6 * weekly_df$TAVG_CI + 0.4 * weekly_df$TAVG_GH
+
+# Split into train/test
+train_df <- weekly_df[weekly_df$date <= as.Date("2024-11-03"), ]
+test_df <- weekly_df[weekly_df$date > as.Date("2024-11-03"), ]
+
+# Create training series
+y_train <- ts(train_df$price, frequency = 52)
+y_diff <- diff(y_train)
+
+# Define GARCH specifications
+garch_specs <- list(
+  GARCH_11 = ugarchspec(mean.model = list(armaOrder = c(2, 1)),
+                        variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+                        distribution.model = "std"),
+
+  GARCH_21 = ugarchspec(mean.model = list(armaOrder = c(2, 1)),
+                        variance.model = list(model = "sGARCH", garchOrder = c(2, 1)),
+                        distribution.model = "std"),
+
+  GARCH_22 = ugarchspec(mean.model = list(armaOrder = c(2, 1)),
+                        variance.model = list(model = "sGARCH", garchOrder = c(2, 2)),
+                        distribution.model = "std"),
+
+  EGARCH_11 = ugarchspec(mean.model = list(armaOrder = c(2, 1)),
+                         variance.model = list(model = "eGARCH", garchOrder = c(1, 1)),
+                         distribution.model = "std")
+)
+
+# Fit models and compare
+results <- lapply(names(garch_specs), function(name) {
+  spec <- garch_specs[[name]]
+  fit <- tryCatch(ugarchfit(spec, data = y_diff, solver = "hybrid"), error = function(e) NULL)
+
+  if (!is.null(fit)) {
+    arch_lm <- tryCatch(ArchTest(residuals(fit, standardize = TRUE), lags = 5)$p.value, error = function(e) NA)
+
+    tibble(
+      Model = name,
+      AIC = infocriteria(fit)[1],
+      LogLikelihood = likelihood(fit),
+      ARCH_p = arch_lm,
+      Converged = fit@fit$convergence == 0
+    )
+  } else {
+    tibble(Model = name, AIC = NA, LogLikelihood = NA, ARCH_p = NA, Converged = FALSE)
+  }
+})
+
+# Combine results
+model_comparison <- bind_rows(results) %>% arrange(AIC)
+print(model_comparison)
+
+```
+
+
+```{r}
+library(forecast)
+library(rugarch)
+library(tidyverse)
+
+# Step 1: Load data
+df <- read.csv("weekly_aggregated_data.csv")
+df$date <- as.Date(df$date)
+
+# Step 2: Create weighted weather variables
+df$PRCP_weighted <- 0.6 * df$PRCP_CI + 0.4 * df$PRCP_GH
+df$TAVG_weighted <- 0.6 * df$TAVG_CI + 0.4 * df$TAVG_GH
+
+# Step 3: Split train/test (adjust date cutoff accordingly)
+train_df <- df[df$date <= "2024-12-30", ]
+test_df <- df[df$date > "2024-12-30", ]
+
+# Step 4: Prepare target and exogenous variables
+y_train <- ts(train_df$price, frequency = 52)  # weekly seasonality
+xreg_train <- as.matrix(train_df[, c("PRCP_weighted", "TAVG_weighted")])
+xreg_test <- as.matrix(test_df[, c("PRCP_weighted", "TAVG_weighted")])
+
+# Step 5: Fit ARIMAX(2,1,1)
+fit_arimax <- Arima(y_train, order = c(2, 1, 2), xreg = xreg_train)
+summary(fit_arimax)
+
+# Step 6: Get ARIMAX residuals for GARCHX
+resid_arimax <- residuals(fit_arimax)
+
+# Step 7: Fit GARCHX(2,2)
+spec_garchx <- ugarchspec(
+  mean.model = list(armaOrder = c(2, 2), include.mean = FALSE),
+  variance.model = list(
+    model = "sGARCH",
+    garchOrder = c(1, 1),
+    external.regressors = xreg_train
+  ),
+  distribution.model = "std"
+)
+
+start_time <- Sys.time()
+fit_garchx <- ugarchfit(spec_garchx, data = resid_arimax)
+print(Sys.time() - start_time)
+show(fit_garchx)
+
+# Step 8: Forecast volatility
+n_ahead <- nrow(test_df)
+garchx_forecast <- ugarchforecast(
+  fit_garchx,
+  n.ahead = n_ahead,
+  external.forecasts = list(vexreg = xreg_test)
+)
+vol_forecast <- sigma(garchx_forecast)[1:n_ahead]
+
+# Step 9: Forecast ARIMAX mean
+fcast_arimax <- forecast(fit_arimax, h = n_ahead, xreg = xreg_test)
+predicted <- as.numeric(fcast_arimax$mean)
+
+# Step 10: Build final forecast dataframe
+plot_df <- tibble(
+  date = test_df$date,
+  actual = test_df$price,
+  predicted = predicted,
+  volatility = vol_forecast,
+  upper = predicted + 2 * vol_forecast,
+  lower = predicted - 2 * vol_forecast
+)
+
+# Step 11: Plot with legends
+ggplot(plot_df, aes(x = date)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill = "Volatility Band"), alpha = 0.2) +
+  geom_line(aes(y = actual, color = "Actual Price"), linewidth = 1) +
+  geom_line(aes(y = predicted, color = "Predicted Price"), linewidth = 1) +
+  scale_fill_manual(values = c("Volatility Band" = "lightblue")) +  # change ribbon color
+  scale_color_manual(values = c("Actual Price" = "red", "Predicted Price" = "blue")) +
+  labs(title = "ARIMAX(2,1,2) + GARCHX(1,1) Forecast (Weekly)",
+       x = "Date", y = "Cocoa Price",
+       color = "Legend", fill = "Legend") +
+  theme_minimal()
+
+
+# Step 12: Forecast accuracy
+mae <- mean(abs(plot_df$actual - plot_df$predicted))
+rmse <- sqrt(mean((plot_df$actual - plot_df$predicted)^2))
+mape <- mean(abs((plot_df$actual - plot_df$predicted) / plot_df$actual)) * 100
+
+cat("Forecast Evaluation (ARIMAX + GARCHX):\n")
+cat("MAE:", round(mae, 2), "\n")
+cat("RMSE:", round(rmse, 2), "\n")
+cat("MAPE:", round(mape, 2), "%\n")
+```
+
+```{r}
+# Ensure proper use of dplyr::select
+comparison_table <- dplyr::select(plot_df, date, actual, predicted) %>%
+  mutate(
+    error = actual - predicted,
+    abs_error = abs(error)
+  )
+
+# Round for readability (optional)
+comparison_table <- comparison_table %>%
+  mutate(across(c(actual, predicted, error, abs_error), round, 2))
+
+# Print the table
+print(comparison_table)
+
+```
+
+
+```{r}
+library(forecast)
+library(rugarch)
+library(tidyverse)
+
+# Step 1: Load data
+df <- read.csv("weekly_with_usd_open.csv")
+df$date <- as.Date(df$date)
+
+# Step 2: Create weighted weather variables
+df$PRCP_weighted <- 0.6 * df$PRCP_CI + 0.4 * df$PRCP_GH
+df$TAVG_weighted <- 0.6 * df$TAVG_CI + 0.4 * df$TAVG_GH
+
+# Step 3: Split train/test
+train_df <- df[df$date <= "2024-12-30", ]
+test_df <- df[df$date > "2024-12-30", ]
+
+# Step 4: Prepare target and xreg (including USD Index)
+y_train <- ts(train_df$price, frequency = 52)
+xreg_train <- as.matrix(train_df[, c("PRCP_weighted", "TAVG_weighted", "usd_open")])
+xreg_test <- as.matrix(test_df[, c("PRCP_weighted", "TAVG_weighted", "usd_open")])
+
+# Step 5: Fit ARIMAX(2,1,2)
+fit_arimax <- Arima(y_train, order = c(2, 1, 2), xreg = xreg_train)
+summary(fit_arimax)
+
+# Step 6: Get residuals for GARCH
+resid_arimax <- residuals(fit_arimax)
+
+# Step 7: Fit GARCHX(1,1)
+spec_garchx <- ugarchspec(
+  mean.model = list(armaOrder = c(2, 2), include.mean = FALSE),
+  variance.model = list(
+    model = "sGARCH",
+    garchOrder = c(1, 1),
+    external.regressors = xreg_train
+  ),
+  distribution.model = "std"
+)
+
+fit_garchx <- ugarchfit(spec_garchx, data = resid_arimax, solver = "hybrid")
+show(fit_garchx)
+
+# Step 8: Forecast volatility
+n_ahead <- nrow(test_df)
+garchx_forecast <- ugarchforecast(
+  fit_garchx,
+  n.ahead = n_ahead,
+  external.forecasts = list(vexreg = xreg_test)
+)
+vol_forecast <- sigma(garchx_forecast)[1:n_ahead]
+
+# Step 9: Forecast ARIMAX mean
+fcast_arimax <- forecast(fit_arimax, h = n_ahead, xreg = xreg_test)
+predicted <- as.numeric(fcast_arimax$mean)
+
+# Step 10: Build forecast dataframe
+plot_df <- tibble(
+  date = test_df$date,
+  actual = test_df$price,
+  predicted = predicted,
+  volatility = vol_forecast,
+  upper = predicted + 2 * vol_forecast,
+  lower = predicted - 2 * vol_forecast
+)
+
+# Step 11: Plot
+ggplot(plot_df, aes(x = date)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill = "Volatility Band"), alpha = 0.2) +
+  geom_line(aes(y = actual, color = "Actual Price"), linewidth = 1) +
+  geom_line(aes(y = predicted, color = "Predicted Price"), linewidth = 1) +
+  scale_fill_manual(values = c("Volatility Band" = "skyblue")) +
+  scale_color_manual(values = c("Actual Price" = "black", "Predicted Price" = "blue")) +
+  labs(title = "ARIMAX(2,1,2) + GARCHX(1,1) Forecast (Weekly, with USD Index)",
+       x = "Date", y = "Cocoa Price",
+       color = "Legend", fill = "Legend") +
+  theme_minimal()
+
+# Step 12: Accuracy
+mae <- mean(abs(plot_df$actual - plot_df$predicted))
+rmse <- sqrt(mean((plot_df$actual - plot_df$predicted)^2))
+mape <- mean(abs((plot_df$actual - plot_df$predicted) / plot_df$actual)) * 100
+
+cat("Forecast Evaluation (ARIMAX + GARCHX with USD Index):\n")
+cat("MAE:", round(mae, 2), "\n")
+cat("RMSE:", round(rmse, 2), "\n")
+cat("MAPE:", round(mape, 2), "%\n")
+
+```
+
+```{r}
+# Load required libraries
+library(tidyverse)
+library(tseries)
+library(urca)
+library(forecast)
+
+# Load your data
+df <- read.csv("weekly_with_usd_open.csv")
+df$date <- as.Date(df$date)
+y <- ts(df$price, frequency = 52)  # Weekly data
+
+# Plot the time series
+autoplot(y) +
+  labs(title = "Cocoa Price Time Series", y = "Price", x = "Time") +
+  theme_minimal()
+
+# ADF Test (Augmented Dickey-Fuller) for stationarity
+adf_result <- adf.test(y)
+print(adf_result)
+
+# KPSS Test for stationarity (alternative way)
+kpss_result <- ur.kpss(y)
+summary(kpss_result)
+
+# Plot ACF and PACF
+acf(y, main = "ACF of Cocoa Price")
+pacf(y, main = "PACF of Cocoa Price")
+```
+
+```{r}
+# Step 2: Differencing to induce stationarity
+y_diff <- diff(y)  # where y = your original time series
+
+# ADF and KPSS again
+library(tseries)
+adf.test(y_diff)
+kpss.test(y_diff)
+
+# ACF & PACF after differencing
+acf(y_diff, main = "ACF of Differenced Series")
+pacf(y_diff, main = "PACF of Differenced Series")
+```
+
+```{r}
+library(forecast)
+
+# Fit ARIMA model
+fit_arima <- Arima(y, order = c(2, 1, 2))  # Change to test other orders
+
+# Summary and diagnostics
+summary(fit_arima)
+checkresiduals(fit_arima)
+```
+
+```{r}
+library(FinTS)  # for ArchTest function
+
+# Use residuals from ARIMA model
+arima_resid <- residuals(fit_arima)
+
+# Perform ARCH LM Test
+ArchTest(arima_resid, lags = 5)
+```
+
+```{r}
+library(rugarch)
+
+# Step 1: Specify GARCH(1,1) model with no ARMA in the mean equation (since we're using ARIMA residuals)
+garch_spec <- ugarchspec(
+  mean.model = list(armaOrder = c(0, 0), include.mean = FALSE),
+  variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+  distribution.model = "std"  # Use "std" for Student's t, or "norm" for normal
+)
+
+# Step 2: Fit the model to the ARIMA residuals
+garch_fit <- ugarchfit(spec = garch_spec, data = arima_resid)
+
+# Step 3: View model summary
+show(garch_fit)
+
+```
+
+```{r}
+library(forecast)
+library(rugarch)
+library(tidyverse)
+
+# Step 1: Load data
+df <- read.csv("weekly_with_usd_open.csv")
+df$date <- as.Date(df$date)
+
+# Step 2: Create weighted weather variables
+df$PRCP_weighted <- 0.6 * df$PRCP_CI + 0.4 * df$PRCP_GH
+df$TAVG_weighted <- 0.6 * df$TAVG_CI + 0.4 * df$TAVG_GH
+
+# Step 3: Split train/test
+train_df <- df[df$date <= "2024-12-30", ]
+test_df <- df[df$date > "2024-12-30", ]
+
+# Step 4: Prepare target and xreg (including USD Index)
+y_train <- ts(train_df$price, frequency = 52)
+xreg_train <- as.matrix(train_df[, c("PRCP_weighted", "TAVG_weighted", "usd_open")])
+xreg_test <- as.matrix(test_df[, c("PRCP_weighted", "TAVG_weighted", "usd_open")])
+
+# Step 5: Fit ARIMAX(2,1,2)
+fit_arimax <- Arima(y_train, order = c(2, 1, 2), xreg = xreg_train)
+summary(fit_arimax)
+
+# Step 6: Get residuals for GARCH
+resid_arimax <- residuals(fit_arimax)
+
+# Step 7: Fit GARCHX(1,1)
+spec_garchx <- ugarchspec(
+  mean.model = list(armaOrder = c(2, 2), include.mean = FALSE),
+  variance.model = list(
+    model = "sGARCH",
+    garchOrder = c(1, 1),
+    external.regressors = xreg_train
+  ),
+  distribution.model = "std"
+)
+
+fit_garchx <- ugarchfit(spec_garchx, data = resid_arimax, solver = "hybrid")
+show(fit_garchx)
+
+# Step 8: Forecast volatility
+n_ahead <- nrow(test_df)
+garchx_forecast <- ugarchforecast(
+  fit_garchx,
+  n.ahead = n_ahead,
+  external.forecasts = list(vexreg = xreg_test)
+)
+vol_forecast <- sigma(garchx_forecast)[1:n_ahead]
+
+# Step 9: Forecast ARIMAX mean
+fcast_arimax <- forecast(fit_arimax, h = n_ahead, xreg = xreg_test)
+predicted <- as.numeric(fcast_arimax$mean)
+
+# Step 10: Build forecast dataframe
+plot_df <- tibble(
+  date = test_df$date,
+  actual = test_df$price,
+  predicted = predicted,
+  volatility = vol_forecast,
+  upper = predicted + 2 * vol_forecast,
+  lower = predicted - 2 * vol_forecast
+)
+
+# Step 11: Plot
+ggplot(plot_df, aes(x = date)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill = "Volatility Band"), alpha = 0.2) +
+  geom_line(aes(y = actual, color = "Actual Price"), linewidth = 1) +
+  geom_line(aes(y = predicted, color = "Predicted Price"), linewidth = 1) +
+  scale_fill_manual(values = c("Volatility Band" = "skyblue")) +
+  scale_color_manual(values = c("Actual Price" = "black", "Predicted Price" = "blue")) +
+  labs(title = "ARIMAX(2,1,2) + GARCHX(1,1) Forecast (Weekly)",
+       x = "Date", y = "Cocoa Price",
+       color = "Legend", fill = "Legend") +
+  theme_minimal()
+
+# Step 12: Accuracy
+mae <- mean(abs(plot_df$actual - plot_df$predicted))
+rmse <- sqrt(mean((plot_df$actual - plot_df$predicted)^2))
+mape <- mean(abs((plot_df$actual - plot_df$predicted) / plot_df$actual)) * 100
+
+cat("Forecast Evaluation (ARIMAX + GARCHX):\n")
+cat("MAE:", round(mae, 2), "\n")
+cat("RMSE:", round(rmse, 2), "\n")
+cat("MAPE:", round(mape, 2), "%\n")
+```
+
+
+```{r}
+library(FinTS)
+
+# Step 13: Check for remaining autocorrelation in residuals
+resid_std <- residuals(fit_garchx, standardize = TRUE)
+
+# Ljung-Box Test on standardized residuals
+Box.test(resid_std, lag = 10, type = "Ljung-Box")
+
+# Ljung-Box Test on squared residuals (ARCH effects)
+Box.test(resid_std^2, lag = 10, type = "Ljung-Box")
+
+# Step 14: ARCH LM test (should be > 0.05 if ARCH is gone)
+ArchTest(resid_std, lags = 10)
+
+# Step 15: Sign Bias Test
+library(rugarch)
+sign_bias <- signbias(fit_garchx)
+print(sign_bias)
+
+# Step 16: Plot residuals
+plot(resid_std, type = 'l', main = "Standardized Residuals (GARCHX)", ylab = "Value")
+abline(h = 0, col = "red")
+
+# Step 17: Check normality visually
+hist(resid_std, breaks = 50, probability = TRUE, main = "Histogram of Std Residuals")
+lines(density(resid_std), col = "blue", lwd = 2)
+
+```
+
+```{r}
+library(forecast)
+
+# === Model 1: ARIMA(2,1,2) without xreg ===
+model_arima <- Arima(y_train, order = c(3, 1, 2))
+
+# === Model 2: ARIMAX(2,1,2) with all exogenous variables ===
+xreg_full <- as.matrix(train_df[, c("PRCP_weighted", "TAVG_weighted", "usd_open")])
+model_arimax <- Arima(y_train, order = c(3, 1, 2), xreg = xreg_full)
+
+# === Likelihood Ratio Test ===
+LL1 <- logLik(model_arima)   # log-likelihood of ARIMA
+LL2 <- logLik(model_arimax)  # log-likelihood of ARIMAX
+
+# Degrees of freedom
+df1 <- attr(LL1, "df")
+df2 <- attr(LL2, "df")
+
+# Likelihood Ratio Test Statistic
+LR_stat <- 2 * (as.numeric(LL2) - as.numeric(LL1))
+df_diff <- df2 - df1
+p_value <- pchisq(LR_stat, df = df_diff, lower.tail = FALSE)
+
+cat("Likelihood Ratio Test:\n")
+cat("LR statistic =", round(LR_stat, 2), "\n")
+cat("Degrees of freedom =", df_diff, "\n")
+cat("p-value =", round(p_value, 4), "\n")
+
+```
+```{r}
+library(forecast)
+library(rugarch)
+library(tidyverse)
+
+# Step 1: Load data
+df <- read.csv("weekly_with_usd_open.csv")
+df$date <- as.Date(df$date)
+
+# Step 2: Split train/test
+train_df <- df[df$date <= "2024-12-30", ]
+test_df <- df[df$date > "2024-12-30", ]
+
+# Step 3: Prepare target variable only (no xreg)
+y_train <- ts(train_df$price, frequency = 52)
+y_test <- test_df$price
+
+# Step 4: Fit ARIMA(3,1,2) without exogenous variables
+fit_arima <- Arima(y_train, order = c(2, 1, 2))
+summary(fit_arima)
+
+# Step 5: Get residuals
+resid_arima <- residuals(fit_arima)
+
+# Step 6: Fit GARCH(1,1) on ARIMA residuals (no xreg)
+spec_garch <- ugarchspec(
+  mean.model = list(armaOrder = c(2, 2), include.mean = FALSE),
+  variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+  distribution.model = "std"
+)
+
+fit_garch <- ugarchfit(spec_garch, data = resid_arima, solver = "hybrid")
+show(fit_garch)
+
+# Step 7: Forecast GARCH volatility
+n_ahead <- length(y_test)
+garch_forecast <- ugarchforecast(fit_garch, n.ahead = n_ahead)
+vol_forecast <- sigma(garch_forecast)[1:n_ahead]
+
+# Step 8: Forecast ARIMA mean
+fcast_arima <- forecast(fit_arima, h = n_ahead)
+predicted <- as.numeric(fcast_arima$mean)
+
+# Step 9: Combine results
+plot_df <- tibble(
+  date = test_df$date,
+  actual = y_test,
+  predicted = predicted,
+  volatility = vol_forecast,
+  upper = predicted + 2 * vol_forecast,
+  lower = predicted - 2 * vol_forecast
+)
+
+# Step 10: Plot
+ggplot(plot_df, aes(x = date)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill = "Volatility Band"), alpha = 0.2) +
+  geom_line(aes(y = actual, color = "Actual Price"), linewidth = 1) +
+  geom_line(aes(y = predicted, color = "Predicted Price"), linewidth = 1) +
+  scale_fill_manual(values = c("Volatility Band" = "skyblue")) +
+  scale_color_manual(values = c("Actual Price" = "black", "Predicted Price" = "blue")) +
+  labs(title = "ARIMA(2,1,2) + GARCH(1,1) Forecast (No Exogenous Variables)",
+       x = "Date", y = "Cocoa Price",
+       color = "Legend", fill = "Legend") +
+  theme_minimal()
+
+# Step 11: Accuracy
+mae <- mean(abs(plot_df$actual - plot_df$predicted))
+rmse <- sqrt(mean((plot_df$actual - plot_df$predicted)^2))
+mape <- mean(abs((plot_df$actual - plot_df$predicted) / plot_df$actual)) * 100
+
+cat("Forecast Evaluation (ARIMA + GARCH without exogenous variables):\n")
+cat("MAE:", round(mae, 2), "\n")
+cat("RMSE:", round(rmse, 2), "\n")
+cat("MAPE:", round(mape, 2), "%\n")
+
+```
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(ggpubr)
+
+# Load and prepare data
+df <- read.csv("weekly_with_usd_open.csv")
+df$date <- as.Date(df$date)
+
+# Create weighted weather variables if not already present
+df <- df %>%
+  mutate(
+    PRCP_weighted = 0.6 * PRCP_CI + 0.4 * PRCP_GH,
+    TAVG_weighted = 0.6 * TAVG_CI + 0.4 * TAVG_GH,
+    month = month(date, label = TRUE),
+    year = year(date)
+  )
+
+# 1. Line plot: Weekly temperature and precipitation
+p1 <- ggplot(df, aes(x = date)) +
+  geom_line(aes(y = TAVG_weighted), color = "firebrick") +
+  labs(title = "Weekly Average Temperature", y = "Temperature (°C)", x = "Date") +
+  theme_minimal()
+
+p2 <- ggplot(df, aes(x = date)) +
+  geom_line(aes(y = PRCP_weighted), color = "steelblue") +
+  labs(title = "Weekly Precipitation", y = "Precipitation (mm)", x = "Date") +
+  theme_minimal()
+
+# 2. Seasonal Boxplots
+bp1 <- ggplot(df, aes(x = month, y = TAVG_weighted)) +
+  geom_boxplot(fill = "tomato") +
+  labs(title = "Monthly Temperature Distribution", x = "Month", y = "Temperature (°C)") +
+  theme_minimal()
+
+bp2 <- ggplot(df, aes(x = month, y = PRCP_weighted)) +
+  geom_boxplot(fill = "skyblue") +
+  labs(title = "Monthly Precipitation Distribution", x = "Month", y = "Precipitation (mm)") +
+  theme_minimal()
+
+# 3. Cross-Correlation Plot: Precipitation vs Cocoa Price
+ccf_plot <- ccf(df$PRCP_weighted, df$price, lag.max = 52, plot = FALSE)
+ccf_df <- data.frame(
+  lag = ccf_plot$lag,
+  correlation = ccf_plot$acf
+)
+
+p3 <- ggplot(ccf_df, aes(x = lag, y = correlation)) +
+  geom_bar(stat = "identity", fill = "darkgreen") +
+  geom_hline(yintercept = c(0.2, -0.2), linetype = "dashed", color = "gray40") +
+  labs(title = "Cross-Correlation: Precipitation vs Cocoa Price", x = "Lag (weeks)", y = "Correlation") +
+  theme_minimal()
+
+# Arrange plots
+ggarrange(p1, p2, bp1, bp2, p3, ncol = 2, nrow = 3)
+
+```
+
+```{r}
+library(tidyverse)
+library(zoo)
+library(ggpubr)
+library(scales)
+
+# Load data
+df <- read.csv("weekly_with_usd_open.csv")
+df$date <- as.Date(df$date)
+
+# 1. Time series plot: USD Index vs Cocoa Price
+p1 <- ggplot(df, aes(x = date)) +
+  geom_line(aes(y = price), color = "chocolate", size = 1) +
+  geom_line(aes(y = usd_open * 100), color = "blue", size = 1, linetype = "dashed") +
+  scale_y_continuous(
+    name = "Cocoa Price (USD)",
+    sec.axis = sec_axis(~ . / 100, name = "USD Index")
+  ) +
+  labs(title = "Weekly Cocoa Price and USD Index", x = "Date") +
+  theme_minimal() +
+  theme(axis.title.y.right = element_text(color = "blue"),
+        axis.title.y.left = element_text(color = "chocolate"))
+
+# 2. Rolling correlation (52 weeks)
+df <- df %>%
+  arrange(date) %>%
+  mutate(
+    roll_corr = rollapplyr(
+      data = cbind(price, usd_open),
+      width = 52,
+      FUN = function(x) cor(x[, 1], x[, 2], use = "complete.obs"),
+      by.column = FALSE,
+      fill = NA
+    )
+  )
+
+p2 <- ggplot(df, aes(x = date, y = roll_corr)) +
+  geom_line(color = "darkred") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  labs(title = "52-Week Rolling Correlation between Cocoa Price and USD Index",
+       y = "Rolling Correlation", x = "Date") +
+  theme_minimal()
+
+# 3. Cross-Correlation Function (CCF)
+ccf_data <- ccf(df$usd_open, df$price, lag.max = 52, plot = FALSE)
+ccf_df <- data.frame(
+  lag = ccf_data$lag,
+  correlation = ccf_data$acf
+)
+
+p3 <- ggplot(ccf_df, aes(x = lag, y = correlation)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  geom_hline(yintercept = c(0.2, -0.2), linetype = "dashed", color = "gray40") +
+  labs(title = "Cross-Correlation: USD Index vs Cocoa Price",
+       x = "Lag (weeks)", y = "Correlation") +
+  theme_minimal()
+
+# Arrange visuals together
+ggarrange(p1, p2, p3, ncol = 1)
+
+```
+
